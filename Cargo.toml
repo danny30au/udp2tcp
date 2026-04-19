@@ -1,0 +1,82 @@
+[package]
+name = "udp2tcp"
+version = "0.1.0"
+edition = "2021"
+authors = ["thelakesclub@gmail.com"]
+description = "High-performance multi-core UDP↔TCP proxy, WireGuard-compatible"
+license = "MIT"
+repository = "https://github.com/thelakesclub/udp2tcp"
+readme = "README.md"
+keywords = ["udp", "tcp", "proxy", "wireguard", "tunnel"]
+categories = ["network-programming", "command-line-utilities"]
+
+[[bin]]
+name = "udp2tcp"
+path = "src/main.rs"
+
+[lib]
+name = "udp2tcp_lib"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime — multi-threaded Tokio with io_uring on Linux
+tokio = { version = "1", features = ["full", "io-util", "net", "rt-multi-thread", "macros", "sync", "signal"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Metrics / stats
+prometheus = { version = "0.13", optional = true }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# CPU affinity pinning
+core_affinity = "0.8"
+
+# Fast byte manipulation (zero-copy path)
+bytes = "1"
+
+# WireGuard framing length-prefix codec
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Async stream/sink traits (used by FramedRead/FramedWrite)
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+# Lock-free concurrent hashmap for session table
+dashmap = "6"
+
+# Cross-platform socket options (SO_REUSEPORT, buffer sizes)
+socket2 = { version = "0.5", features = ["all"] }
+
+# Raw libc calls for TCP buffer sizing
+libc = "0.2"
+
+# Defer-on-unwind guard for session cleanup
+scopeguard = "1"
+
+# Optional TLS wrapping for TCP leg (disabled by default)
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[features]
+default = []
+metrics = ["dep:prometheus"]
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 1
