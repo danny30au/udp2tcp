@@ -14,6 +14,7 @@ use udp2tcp_lib::{
 
 fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::parse());
+    daemonize_if_requested(&cfg)?;
 
     // Initialize structured logging.
     tracing_subscriber::fmt()
@@ -34,6 +35,7 @@ fn main() -> anyhow::Result<()> {
         mode    = if cfg.reverse { "tcp→udp (reverse)" } else { "udp→tcp" },
         reuseport = cfg.reuseport,
         cpu_pin   = cfg.cpu_pin,
+        daemon    = cfg.daemon,
         "udp2tcp starting"
     );
 
@@ -70,4 +72,29 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("worker {worker_id}"))
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn daemonize_if_requested(cfg: &Config) -> anyhow::Result<()> {
+    if !cfg.daemon {
+        return Ok(());
+    }
+
+    let rc = unsafe { libc::daemon(1, 1) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to daemonize process");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemonize_if_requested(cfg: &Config) -> anyhow::Result<()> {
+    if cfg.daemon {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "--daemon is only supported on Linux",
+        )
+        .into());
+    }
+    Ok(())
 }
