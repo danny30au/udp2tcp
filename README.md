@@ -9,6 +9,7 @@ A high-performance, multi-core UDP ↔ TCP proxy written in Rust, purpose-built 
 - **Bidirectional** — UDP→TCP (client side) or TCP→UDP (`--reverse`, server/endpoint side)  
 - **Zero-copy path** — `Bytes` slices avoid unnecessary allocations on the hot path  
 - **Lock-free session table** — DashMap with per-worker sharding  
+- **Parallel TCP streams per session** (`--tcp-streams`) to break single-stream bottlenecks  
 - **Optional CPU affinity pinning** (`--cpu-pin`) for NUMA/cache locality  
 - **Optional Linux daemon mode** (`--daemon`) for background operation  
 - **Configurable via CLI flags or environment variables**  
@@ -52,7 +53,8 @@ TCP→UDP mode (--reverse, server/endpoint side)
 ### Session management
 
 Each unique `(src_ip, src_port)` in UDP→TCP mode gets its own logical session:
-- A `mpsc::channel` carries packets from the UDP receiver to the per-session TCP task
+- One or more TCP streams (`--tcp-streams`) are opened per session
+- Packets are distributed across stream channels in round-robin order
 - Sessions expire after `--idle-timeout` seconds (default 180 s)
 - A background sweeper runs every 30 s
 - `--max-sessions` caps the session table to prevent resource exhaustion
@@ -117,6 +119,7 @@ udp2tcp \
 | `--udp-recv-buf` | `UDP2TCP_UDP_RECV_BUF` | 26214400 (25 MB) | UDP SO_RCVBUF |
 | `--udp-send-buf` | `UDP2TCP_UDP_SEND_BUF` | 26214400 (25 MB) | UDP SO_SNDBUF |
 | `--tcp-buf` | `UDP2TCP_TCP_BUF` | 4194304 (4 MB) | TCP SO_SNDBUF/SO_RCVBUF |
+| `--tcp-streams` | `UDP2TCP_TCP_STREAMS` | 1 | Parallel TCP streams per UDP session (UDP→TCP mode) |
 | `--pkt-buf` | `UDP2TCP_PKT_BUF` | 65536 | Per-read buffer size |
 | `--max-sessions` | `UDP2TCP_MAX_SESSIONS` | 65536 | Max UDP client sessions |
 | `--idle-timeout` | `UDP2TCP_IDLE_TIMEOUT` | 180 | Session idle timeout (s) |
