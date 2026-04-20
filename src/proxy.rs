@@ -183,6 +183,7 @@ async fn tcp_forward_task(
                         metrics::inc_tx(len as u64);
                         pending_writes += 1;
                         let mut write_failed = false;
+                        let mut stream_disconnected = false;
 
                         while pending_writes < BATCH_SIZE {
                             match rx.try_recv() {
@@ -197,10 +198,22 @@ async fn tcp_forward_task(
                                     metrics::inc_tx(len as u64);
                                     pending_writes += 1;
                                 }
-                                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    stream_disconnected = true;
+                                    break;
+                                }
                             }
                         }
                         if write_failed {
+                            break;
+                        }
+                        if stream_disconnected {
+                            if pending_writes > 0 {
+                                if let Err(e) = framed_wr.flush().await {
+                                    error!(stream = stream_id, client = %client_addr, err = %e, "TCP flush failed");
+                                }
+                            }
                             break;
                         }
 
@@ -215,7 +228,9 @@ async fn tcp_forward_task(
                     }
                     None => {
                         if pending_writes > 0 {
-                            let _ = framed_wr.flush().await;
+                            if let Err(e) = framed_wr.flush().await {
+                                error!(stream = stream_id, client = %client_addr, err = %e, "TCP flush failed");
+                            }
                         }
                         break; // sender dropped → session closed
                     }
@@ -356,7 +371,9 @@ async fn handle_tcp_client(
     }
 
     if pending_writes > 0 {
-        let _ = framed_wr.flush().await;
+        if let Err(e) = framed_wr.flush().await {
+            error!(peer = %peer_addr, err = %e, "TCP final flush failed");
+        }
     }
 
     debug!(peer = %peer_addr, "reverse session closed");

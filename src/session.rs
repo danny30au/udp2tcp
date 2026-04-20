@@ -51,7 +51,11 @@ impl Session {
             let idx = (start + offset) % count;
             match self.txs[idx].try_send(pkt.clone()) {
                 Ok(()) => return Ok(()),
-                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => continue,
+                Err(TrySendError::Full(_)) => continue,
+                Err(TrySendError::Closed(_)) => {
+                    debug!("session stream channel {} is closed", idx);
+                    continue;
+                }
             }
         }
 
