@@ -7,7 +7,7 @@ A high-performance, multi-core UDP ↔ TCP proxy written in Rust, purpose-built 
 - **Multi-core scaling** via SO_REUSEPORT + one Tokio runtime per OS thread  
 - **WireGuard-compatible framing** — 2-byte big-endian length prefix (identical to wg-tcp-tunnel / wstunnel wire format)  
 - **Bidirectional** — UDP→TCP (client side) or TCP→UDP (`--reverse`, server/endpoint side)  
-- **Zero-copy path** — `Bytes` slices avoid unnecessary allocations on the hot path  
+- **Low-copy packet path** — `Bytes`/`BytesMut` avoid extra hot-path packet copies  
 - **Lock-free session table** — DashMap with per-worker sharding  
 - **Parallel TCP streams per session** (`--tcp-streams`) to break single-stream bottlenecks  
 - **Optional CPU affinity pinning** (`--cpu-pin`) for NUMA/cache locality  
@@ -119,11 +119,13 @@ udp2tcp \
 | `--udp-recv-buf` | `UDP2TCP_UDP_RECV_BUF` | 26214400 (25 MB) | UDP SO_RCVBUF |
 | `--udp-send-buf` | `UDP2TCP_UDP_SEND_BUF` | 26214400 (25 MB) | UDP SO_SNDBUF |
 | `--tcp-buf` | `UDP2TCP_TCP_BUF` | 4194304 (4 MB) | TCP SO_SNDBUF/SO_RCVBUF |
+| `--write-batch` | `UDP2TCP_WRITE_BATCH` | 32 | Number of TCP frames to batch before flushing |
+| `--flush-ms` | `UDP2TCP_FLUSH_MS` | 2 | Max time to hold queued TCP frames before flushing |
 | `--tcp-streams` | `UDP2TCP_TCP_STREAMS` | 1 | Parallel TCP streams per UDP session (UDP→TCP mode) |
 | `--pkt-buf` | `UDP2TCP_PKT_BUF` | 65536 | Per-read buffer size |
 | `--max-sessions` | `UDP2TCP_MAX_SESSIONS` | 65536 | Max UDP client sessions |
 | `--idle-timeout` | `UDP2TCP_IDLE_TIMEOUT` | 180 | Session idle timeout (s) |
-| `--nodelay` | `UDP2TCP_NODELAY` | true | TCP_NODELAY |
+| `--nodelay` | `UDP2TCP_NODELAY` | true | TCP_NODELAY (disables Nagle for lower latency; set false for more coalescing) |
 | `--reuseport` | `UDP2TCP_REUSEPORT` | true | SO_REUSEPORT (Linux) |
 | `--cpu-pin` | `UDP2TCP_CPU_PIN` | false | Pin threads to CPU cores |
 | `--log-level` | `RUST_LOG` | info | Log level |
@@ -146,6 +148,12 @@ net.ipv4.tcp_mem = 8388608 12582912 16777216
 ```
 
 Apply with `sysctl --system` or `sysctl -p`.
+
+For high-bandwidth or high-latency links, also try:
+
+- raising `--write-batch` to increase TCP write coalescing
+- raising `--flush-ms` slightly to allow larger batches
+- disabling `--nodelay` if raw throughput matters more than per-packet latency
 
 ## Running as a systemd service
 

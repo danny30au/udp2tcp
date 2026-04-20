@@ -40,6 +40,14 @@ pub struct Config {
     #[arg(long, env = "UDP2TCP_TCP_BUF", default_value_t = 4_194_304)]
     pub tcp_buf: usize,
 
+    /// Number of queued packets to batch before flushing the TCP writer.
+    #[arg(long, env = "UDP2TCP_WRITE_BATCH", default_value_t = 32)]
+    pub write_batch: usize,
+
+    /// Maximum time to hold queued TCP frames before flushing, in milliseconds.
+    #[arg(long, env = "UDP2TCP_FLUSH_MS", default_value_t = 2)]
+    pub flush_ms: u64,
+
     /// Number of parallel TCP streams per logical UDP session (UDP→TCP mode).
     #[arg(long, env = "UDP2TCP_TCP_STREAMS", default_value_t = 1)]
     pub tcp_streams: usize,

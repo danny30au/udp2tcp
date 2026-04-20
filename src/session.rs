@@ -11,8 +11,9 @@
 
 use std::{
     net::SocketAddr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -28,7 +29,7 @@ pub struct Session {
     /// Round-robin index for selecting the next stream.
     next_tx: Arc<AtomicUsize>,
     /// Last time this session was used (for idle timeout sweeping).
-    pub last_seen: Arc<std::sync::Mutex<Instant>>,
+    pub last_seen_millis: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -36,11 +37,11 @@ impl Session {
         Self {
             txs: Arc::new(txs),
             next_tx: Arc::new(AtomicUsize::new(0)),
-            last_seen: Arc::new(std::sync::Mutex::new(Instant::now())),
+            last_seen_millis: Arc::new(AtomicU64::new(now_millis())),
         }
     }
 
-    pub fn try_send(&self, pkt: Bytes) -> Result<(), Bytes> {
+    pub fn try_send(&self, mut pkt: Bytes) -> Result<(), Bytes> {
         let count = self.txs.len();
         if count == 0 {
             return Err(pkt);
@@ -49,10 +50,19 @@ impl Session {
         let start = self.next_tx.fetch_add(1, Ordering::Relaxed) % count;
         for offset in 0..count {
             let idx = (start + offset) % count;
-            match self.txs[idx].try_send(pkt.clone()) {
+            let send_pkt = if offset + 1 == count {
+                pkt
+            } else {
+                pkt.clone()
+            };
+            match self.txs[idx].try_send(send_pkt) {
                 Ok(()) => return Ok(()),
-                Err(TrySendError::Full(_)) => continue,
-                Err(TrySendError::Closed(_)) => {
+                Err(TrySendError::Full(returned)) => {
+                    pkt = returned;
+                    continue;
+                }
+                Err(TrySendError::Closed(returned)) => {
+                    pkt = returned;
                     debug!("session stream channel {} is closed", idx);
                     continue;
                 }
@@ -63,17 +73,27 @@ impl Session {
     }
 
     pub fn touch(&self) {
-        if let Ok(mut t) = self.last_seen.lock() {
-            *t = Instant::now();
-        }
+        self.last_seen_millis.store(now_millis(), Ordering::Relaxed);
     }
 
     pub fn is_idle(&self, timeout: Duration) -> bool {
-        self.last_seen
-            .lock()
-            .map(|t| t.elapsed() > timeout)
-            .unwrap_or(false)
+        now_millis().saturating_sub(self.last_seen_millis.load(Ordering::Relaxed))
+            > duration_to_millis(timeout)
     }
+}
+
+fn now_millis() -> u64 {
+    session_clock_start().elapsed().as_millis() as u64
+}
+
+fn duration_to_millis(duration: Duration) -> u64 {
+    const MAX_U64_AS_U128: u128 = u64::MAX as u128;
+    duration.as_millis().min(MAX_U64_AS_U128) as u64
+}
+
+fn session_clock_start() -> &'static Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now)
 }
 
 /// Concurrent session table.
