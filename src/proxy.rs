@@ -20,7 +20,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::mpsc,
+    sync::mpsc::{self, error::TryRecvError},
     time,
 };
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -90,9 +90,25 @@ pub async fn run_udp_to_tcp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Resul
             s
         } else {
             // No existing session — create one.
-            let (tx, rx) = mpsc::channel::<Bytes>(4096);
-            let session = Session::new(tx);
+            let stream_count = cfg.tcp_streams.max(1);
+            let mut txs = Vec::with_capacity(stream_count);
 
+            for stream_id in 0..stream_count {
+                let (tx, rx) = mpsc::channel::<Bytes>(4096);
+                txs.push(tx);
+
+                // Spawn one TCP forwarder task per configured stream.
+                tokio::spawn(tcp_forward_task(
+                    cfg.clone(),
+                    udp_sock.clone(),
+                    src_addr,
+                    rx,
+                    worker_id,
+                    stream_id,
+                ));
+            }
+
+            let session = Session::new(txs);
             if !sessions.insert(src_addr, session.clone()) {
                 // Table full — drop packet.
                 metrics::inc_errors();
@@ -102,23 +118,13 @@ pub async fn run_udp_to_tcp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Resul
             metrics::SESSIONS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!(worker = worker_id, client = %src_addr, "new session");
 
-            // Spawn the TCP forwarder task for this session.
-            tokio::spawn(tcp_forward_task(
-                cfg.clone(),
-                udp_sock.clone(),
-                src_addr,
-                rx,
-                sessions.clone(),
-                worker_id,
-            ));
-
             sessions.get(&src_addr).unwrap_or(session)
         };
 
         // Forward the packet to the TCP task via channel.
-        if session.tx.try_send(data).is_err() {
+        if session.try_send(data).is_err() {
             metrics::inc_errors();
-            debug!(client = %src_addr, "channel full, dropping packet");
+            debug!(client = %src_addr, "all stream channels full/closed, dropping packet");
         }
     }
 }
@@ -133,24 +139,22 @@ async fn tcp_forward_task(
     udp_sock: Arc<UdpSocket>,
     client_addr: SocketAddr,
     mut rx: mpsc::Receiver<Bytes>,
-    sessions: Arc<SessionTable>,
     worker_id: usize,
+    stream_id: usize,
 ) {
     // Connect to the remote TCP endpoint.
     let tcp_stream = match TcpStream::connect(cfg.remote).await {
         Ok(s) => s,
         Err(e) => {
-            error!(worker = worker_id, client = %client_addr, remote = %cfg.remote,
+            error!(worker = worker_id, stream = stream_id, client = %client_addr, remote = %cfg.remote,
                    err = %e, "TCP connect failed");
             metrics::inc_errors();
-            sessions.remove(&client_addr);
-            metrics::SESSIONS_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
     };
 
     apply_tcp_opts(&tcp_stream, &cfg);
-    info!(worker = worker_id, client = %client_addr, remote = %cfg.remote, "TCP connected");
+    info!(worker = worker_id, stream = stream_id, client = %client_addr, remote = %cfg.remote, "TCP connected");
 
     let (tcp_rd, tcp_wr) = tcp_stream.into_split();
     let mut framed_rd = FramedRead::new(tcp_rd, WireGuardTcpCodec);
@@ -159,24 +163,62 @@ async fn tcp_forward_task(
     use futures::SinkExt;
     use futures::StreamExt;
 
+    const BATCH_SIZE: usize = 32;
+    let mut pending_writes = 0usize;
+    let mut flush_tick = time::interval(Duration::from_millis(2));
+
     // Run both directions concurrently until either side closes.
     loop {
         tokio::select! {
-            biased;
-
             // Outbound: channel → TCP write
             maybe_pkt = rx.recv() => {
                 match maybe_pkt {
                     Some(pkt) => {
                         let len = pkt.len();
-                        if let Err(e) = framed_wr.send(pkt).await {
-                            error!(client = %client_addr, err = %e, "TCP write failed");
+                        if let Err(e) = framed_wr.feed(pkt).await {
+                            error!(stream = stream_id, client = %client_addr, err = %e, "TCP write failed");
                             metrics::inc_errors();
                             break;
                         }
                         metrics::inc_tx(len as u64);
+                        pending_writes += 1;
+                        let mut write_failed = false;
+
+                        while pending_writes < BATCH_SIZE {
+                            match rx.try_recv() {
+                                Ok(pkt) => {
+                                    let len = pkt.len();
+                                    if let Err(e) = framed_wr.feed(pkt).await {
+                                        error!(stream = stream_id, client = %client_addr, err = %e, "TCP write failed");
+                                        metrics::inc_errors();
+                                        write_failed = true;
+                                        break;
+                                    }
+                                    metrics::inc_tx(len as u64);
+                                    pending_writes += 1;
+                                }
+                                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                            }
+                        }
+                        if write_failed {
+                            break;
+                        }
+
+                        if pending_writes >= BATCH_SIZE {
+                            if let Err(e) = framed_wr.flush().await {
+                                error!(stream = stream_id, client = %client_addr, err = %e, "TCP flush failed");
+                                metrics::inc_errors();
+                                break;
+                            }
+                            pending_writes = 0;
+                        }
                     }
-                    None => break, // sender dropped → session closed
+                    None => {
+                        if pending_writes > 0 {
+                            let _ = framed_wr.flush().await;
+                        }
+                        break; // sender dropped → session closed
+                    }
                 }
             }
 
@@ -193,31 +235,36 @@ async fn tcp_forward_task(
                         }
                     }
                     Some(Err(e)) => {
-                        error!(client = %client_addr, err = %e, "TCP frame decode error");
+                        error!(stream = stream_id, client = %client_addr, err = %e, "TCP frame decode error");
                         metrics::inc_errors();
                         break;
                     }
                     None => {
-                        debug!(client = %client_addr, "TCP connection closed by remote");
+                        debug!(stream = stream_id, client = %client_addr, "TCP connection closed by remote");
                         break;
                     }
                 }
             }
+
+            _ = flush_tick.tick(), if pending_writes > 0 => {
+                if let Err(e) = framed_wr.flush().await {
+                    error!(stream = stream_id, client = %client_addr, err = %e, "TCP flush failed");
+                    metrics::inc_errors();
+                    break;
+                }
+                pending_writes = 0;
+            }
         }
     }
 
-    sessions.remove(&client_addr);
-    metrics::SESSIONS_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    debug!(client = %client_addr, "session teardown complete");
+    debug!(stream = stream_id, client = %client_addr, "stream task closed");
 }
 
 // ─── mode B: TCP listen → UDP forward ──────────────────────────────────────
 
 /// Run in TCP→UDP proxy mode (--reverse).
 pub async fn run_tcp_to_udp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(cfg.listen)
-        .await
-        .with_context(|| format!("bind TCP {}", cfg.listen))?;
+    let listener = bind_tcp_listener(&cfg).with_context(|| format!("bind TCP {}", cfg.listen))?;
 
     info!(worker = worker_id, listen = %cfg.listen, "TCP listener ready (reverse mode)");
 
@@ -262,13 +309,14 @@ async fn handle_tcp_client(
     use futures::StreamExt;
 
     let mut udp_buf = vec![0u8; cfg.pkt_buf];
+    const BATCH_SIZE: usize = 32;
+    let mut pending_writes = 0usize;
+    let mut flush_tick = time::interval(Duration::from_millis(2));
 
     info!(worker = worker_id, peer = %peer_addr, remote = %cfg.remote, "reverse session started");
 
     loop {
         tokio::select! {
-            biased;
-
             // Inbound: TCP frame → UDP datagram
             maybe_frame = framed_rd.next() => {
                 match maybe_frame {
@@ -290,10 +338,25 @@ async fn handle_tcp_client(
                 let n = result?;
                 let data = Bytes::copy_from_slice(&udp_buf[..n]);
                 let len = n as u64;
-                framed_wr.send(data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                framed_wr.feed(data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
                 metrics::inc_tx(len);
+                pending_writes += 1;
+
+                if pending_writes >= BATCH_SIZE {
+                    framed_wr.flush().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                    pending_writes = 0;
+                }
+            }
+
+            _ = flush_tick.tick(), if pending_writes > 0 => {
+                framed_wr.flush().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                pending_writes = 0;
             }
         }
+    }
+
+    if pending_writes > 0 {
+        let _ = framed_wr.flush().await;
     }
 
     debug!(peer = %peer_addr, "reverse session closed");
@@ -329,6 +392,31 @@ fn bind_udp(cfg: &Config, _worker_id: usize) -> anyhow::Result<UdpSocket> {
     let std_sock: StdUdp = socket.into();
     let tokio_sock = UdpSocket::from_std(std_sock)?;
     Ok(tokio_sock)
+}
+
+fn bind_tcp_listener(cfg: &Config) -> anyhow::Result<TcpListener> {
+    use std::net::TcpListener as StdTcp;
+
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(cfg.listen),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+
+    socket.set_reuse_address(true)?;
+
+    #[cfg(target_os = "linux")]
+    if cfg.reuseport {
+        socket.set_reuse_port(true)?;
+    }
+
+    socket.set_nonblocking(true)?;
+    socket.bind(&cfg.listen.into())?;
+    socket.listen(65_535)?;
+
+    let std_listener: StdTcp = socket.into();
+    let listener = TcpListener::from_std(std_listener)?;
+    Ok(listener)
 }
 
 fn apply_tcp_opts(stream: &TcpStream, cfg: &Config) {

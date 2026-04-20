@@ -40,6 +40,10 @@ pub struct Config {
     #[arg(long, env = "UDP2TCP_TCP_BUF", default_value_t = 4_194_304)]
     pub tcp_buf: usize,
 
+    /// Number of parallel TCP streams per logical UDP session (UDP→TCP mode).
+    #[arg(long, env = "UDP2TCP_TCP_STREAMS", default_value_t = 1)]
+    pub tcp_streams: usize,
+
     /// Per-packet read buffer size in bytes.  Must be >= WireGuard MTU (1500).
     #[arg(long, env = "UDP2TCP_PKT_BUF", default_value_t = 65_536)]
     pub pkt_buf: usize,
