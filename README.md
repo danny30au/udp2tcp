@@ -125,7 +125,7 @@ udp2tcp \
 | `--pkt-buf` | `UDP2TCP_PKT_BUF` | 65536 | Per-read buffer size |
 | `--max-sessions` | `UDP2TCP_MAX_SESSIONS` | 65536 | Max UDP client sessions |
 | `--idle-timeout` | `UDP2TCP_IDLE_TIMEOUT` | 180 | Session idle timeout (s) |
-| `--nodelay` | `UDP2TCP_NODELAY` | true | TCP_NODELAY (better latency; disable for more TCP coalescing) |
+| `--nodelay` | `UDP2TCP_NODELAY` | true | TCP_NODELAY (disables Nagle for lower latency; set false for more coalescing) |
 | `--reuseport` | `UDP2TCP_REUSEPORT` | true | SO_REUSEPORT (Linux) |
 | `--cpu-pin` | `UDP2TCP_CPU_PIN` | false | Pin threads to CPU cores |
 | `--log-level` | `RUST_LOG` | info | Log level |

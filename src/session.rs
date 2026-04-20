@@ -41,14 +41,13 @@ impl Session {
         }
     }
 
-    pub fn try_send(&self, pkt: Bytes) -> Result<(), Bytes> {
+    pub fn try_send(&self, mut pkt: Bytes) -> Result<(), Bytes> {
         let count = self.txs.len();
         if count == 0 {
             return Err(pkt);
         }
 
         let start = self.next_tx.fetch_add(1, Ordering::Relaxed) % count;
-        let mut pkt = pkt;
         for offset in 0..count {
             let idx = (start + offset) % count;
             let send_pkt = if offset + 1 == count {
@@ -88,7 +87,8 @@ fn now_millis() -> u64 {
 }
 
 fn duration_to_millis(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
+    const MAX_U64_AS_U128: u128 = u64::MAX as u128;
+    duration.as_millis().min(MAX_U64_AS_U128) as u64
 }
 
 fn session_clock_start() -> &'static Instant {

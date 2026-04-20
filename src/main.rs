@@ -42,8 +42,9 @@ fn main() -> anyhow::Result<()> {
         "udp2tcp starting"
     );
 
-    // Print sysctl tuning advice if buffers are at defaults.
-    if cfg.udp_recv_buf <= 4_194_304 || cfg.udp_send_buf <= 4_194_304 {
+    // Print sysctl tuning advice when socket buffers are still modest.
+    const SYSCTL_TIP_THRESHOLD: usize = 4_194_304;
+    if cfg.udp_recv_buf <= SYSCTL_TIP_THRESHOLD || cfg.udp_send_buf <= SYSCTL_TIP_THRESHOLD {
         info!(
             "tip: raise kernel UDP buffers for full throughput:\n  \
              sysctl -w net.core.rmem_max=134217728\n  \
