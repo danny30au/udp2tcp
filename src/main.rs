@@ -14,7 +14,6 @@ use udp2tcp_lib::{
 
 fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::parse());
-    daemonize_if_requested(&cfg)?;
 
     // Initialize structured logging.
     tracing_subscriber::fmt()
@@ -26,6 +25,8 @@ fn main() -> anyhow::Result<()> {
         .with_thread_ids(true)
         .compact()
         .init();
+
+    daemonize_if_requested(&cfg)?;
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -80,9 +81,13 @@ fn daemonize_if_requested(cfg: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let rc = unsafe { libc::daemon(1, 1) };
+    const NO_CHDIR: libc::c_int = 1;
+    const NO_CLOSE_STDIO: libc::c_int = 1;
+
+    let rc = unsafe { libc::daemon(NO_CHDIR, NO_CLOSE_STDIO) };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to daemonize process");
+        return Err(std::io::Error::last_os_error())
+            .context("failed to daemonize process - check system permissions and resources");
     }
     Ok(())
 }
