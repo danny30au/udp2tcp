@@ -418,8 +418,6 @@ fn build_udp_socket(
     send_buf: usize,
     reuseport: bool,
 ) -> anyhow::Result<socket2::Socket> {
-    use std::net::UdpSocket as StdUdp;
-
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(bind_addr),
         socket2::Type::DGRAM,
