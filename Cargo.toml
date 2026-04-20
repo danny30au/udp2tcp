@@ -38,7 +38,7 @@ thiserror = "1"
 # CPU affinity pinning
 core_affinity = "0.8"
 
-# Fast byte manipulation (zero-copy path)
+# Fast byte buffers on the hot path
 bytes = "1"
 
 # WireGuard framing length-prefix codec
@@ -55,9 +55,6 @@ socket2 = { version = "0.5", features = ["all"] }
 
 # Raw libc calls for TCP buffer sizing
 libc = "0.2"
-
-# Defer-on-unwind guard for session cleanup
-scopeguard = "1"
 
 # Optional TLS wrapping for TCP leg (disabled by default)
 tokio-rustls = { version = "0.26", optional = true }

@@ -14,10 +14,14 @@
 //!  │  client      │ ◄────────── │  --reverse  │ ◄────────── │  server      │
 //!  └──────────────┘             └─────────────┘             └──────────────┘
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc::{self, error::TryRecvError},
@@ -33,10 +37,6 @@ use crate::{
     session::{Session, SessionTable},
 };
 
-// Suppress unused-import warning for scopeguard (kept as dep for future use)
-#[allow(unused_imports)]
-use scopeguard as _;
-
 // ─── mode A: UDP listen → TCP forward ──────────────────────────────────────
 
 /// Run in UDP→TCP proxy mode.
@@ -45,7 +45,7 @@ use scopeguard as _;
 /// datagrams across all worker sockets automatically (RSS-style load balancing).
 pub async fn run_udp_to_tcp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Result<()> {
     let sessions: Arc<SessionTable> = Arc::new(SessionTable::new(
-        cfg.max_sessions / cfg.num_threads().max(1),
+        cfg.max_sessions.div_ceil(cfg.num_threads().max(1)),
         Duration::from_secs(cfg.idle_timeout),
     ));
 
@@ -69,11 +69,14 @@ pub async fn run_udp_to_tcp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Resul
         });
     }
 
-    let mut pkt_buf = vec![0u8; cfg.pkt_buf];
+    let batch_size = cfg.write_batch.max(1);
+    let flush_interval = Duration::from_millis(cfg.flush_ms.max(1));
+    let mut pkt_buf = BytesMut::with_capacity(cfg.pkt_buf);
 
     loop {
         // Receive next UDP datagram from any client.
-        let (n, src_addr) = match udp_sock.recv_from(&mut pkt_buf).await {
+        pkt_buf.clear();
+        let (n, src_addr) = match udp_sock.recv_buf_from(&mut pkt_buf).await {
             Ok(v) => v,
             Err(e) => {
                 metrics::inc_errors();
@@ -82,7 +85,7 @@ pub async fn run_udp_to_tcp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Resul
             }
         };
 
-        let data = Bytes::copy_from_slice(&pkt_buf[..n]);
+        let data = pkt_buf.split().freeze();
         metrics::inc_rx(n as u64);
 
         // Look up or create a session for this client.
@@ -105,6 +108,8 @@ pub async fn run_udp_to_tcp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Resul
                     rx,
                     worker_id,
                     stream_id,
+                    batch_size,
+                    flush_interval,
                 ));
             }
 
@@ -141,6 +146,8 @@ async fn tcp_forward_task(
     mut rx: mpsc::Receiver<Bytes>,
     worker_id: usize,
     stream_id: usize,
+    batch_size: usize,
+    flush_interval: Duration,
 ) {
     // Connect to the remote TCP endpoint.
     let tcp_stream = match TcpStream::connect(cfg.remote).await {
@@ -154,7 +161,7 @@ async fn tcp_forward_task(
     };
 
     apply_tcp_opts(&tcp_stream, &cfg);
-    info!(worker = worker_id, stream = stream_id, client = %client_addr, remote = %cfg.remote, "TCP connected");
+    debug!(worker = worker_id, stream = stream_id, client = %client_addr, remote = %cfg.remote, "TCP connected");
 
     let (tcp_rd, tcp_wr) = tcp_stream.into_split();
     let mut framed_rd = FramedRead::new(tcp_rd, WireGuardTcpCodec);
@@ -163,9 +170,8 @@ async fn tcp_forward_task(
     use futures::SinkExt;
     use futures::StreamExt;
 
-    const BATCH_SIZE: usize = 32;
     let mut pending_writes = 0usize;
-    let mut flush_tick = time::interval(Duration::from_millis(2));
+    let mut flush_tick = time::interval(flush_interval);
 
     // Run both directions concurrently until either side closes.
     loop {
@@ -185,7 +191,7 @@ async fn tcp_forward_task(
                         let mut write_failed = false;
                         let mut stream_disconnected = false;
 
-                        while pending_writes < BATCH_SIZE {
+                        while pending_writes < batch_size {
                             match rx.try_recv() {
                                 Ok(pkt) => {
                                     let len = pkt.len();
@@ -217,7 +223,7 @@ async fn tcp_forward_task(
                             break;
                         }
 
-                        if pending_writes >= BATCH_SIZE {
+                        if pending_writes >= batch_size {
                             if let Err(e) = framed_wr.flush().await {
                                 error!(stream = stream_id, client = %client_addr, err = %e, "TCP flush failed");
                                 metrics::inc_errors();
@@ -312,7 +318,7 @@ async fn handle_tcp_client(
     apply_tcp_opts(&tcp_stream, &cfg);
 
     // Bind an ephemeral UDP socket to talk to the WireGuard backend.
-    let udp_sock = UdpSocket::bind("0.0.0.0:0").await?;
+    let udp_sock = bind_connected_udp(&cfg.remote, &cfg)?;
     udp_sock.connect(cfg.remote).await?;
     let udp_sock = Arc::new(udp_sock);
 
@@ -323,12 +329,13 @@ async fn handle_tcp_client(
     use futures::SinkExt;
     use futures::StreamExt;
 
-    let mut udp_buf = vec![0u8; cfg.pkt_buf];
-    const BATCH_SIZE: usize = 32;
+    let batch_size = cfg.write_batch.max(1);
+    let flush_interval = Duration::from_millis(cfg.flush_ms.max(1));
+    let mut udp_buf = BytesMut::with_capacity(cfg.pkt_buf);
     let mut pending_writes = 0usize;
-    let mut flush_tick = time::interval(Duration::from_millis(2));
+    let mut flush_tick = time::interval(flush_interval);
 
-    info!(worker = worker_id, peer = %peer_addr, remote = %cfg.remote, "reverse session started");
+    debug!(worker = worker_id, peer = %peer_addr, remote = %cfg.remote, "reverse session started");
 
     loop {
         tokio::select! {
@@ -349,15 +356,18 @@ async fn handle_tcp_client(
             }
 
             // Outbound: UDP datagram → TCP frame
-            result = udp_sock.recv(&mut udp_buf) => {
+            result = async {
+                udp_buf.clear();
+                udp_sock.recv_buf(&mut udp_buf).await
+            } => {
                 let n = result?;
-                let data = Bytes::copy_from_slice(&udp_buf[..n]);
+                let data = udp_buf.split().freeze();
                 let len = n as u64;
                 framed_wr.feed(data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
                 metrics::inc_tx(len);
                 pending_writes += 1;
 
-                if pending_writes >= BATCH_SIZE {
+                if pending_writes >= batch_size {
                     framed_wr.flush().await.map_err(|e| anyhow::anyhow!("{e}"))?;
                     pending_writes = 0;
                 }
@@ -384,10 +394,34 @@ async fn handle_tcp_client(
 
 /// Bind a UDP socket with SO_REUSEPORT if enabled, or plain SO_REUSEADDR.
 fn bind_udp(cfg: &Config, _worker_id: usize) -> anyhow::Result<UdpSocket> {
+    let socket = build_udp_socket(cfg.listen, cfg.udp_recv_buf, cfg.udp_send_buf, cfg.reuseport)?;
+    socket.bind(&cfg.listen.into())?;
+
+    let std_sock: std::net::UdpSocket = socket.into();
+    let tokio_sock = UdpSocket::from_std(std_sock)?;
+    Ok(tokio_sock)
+}
+
+fn bind_connected_udp(remote: &SocketAddr, cfg: &Config) -> anyhow::Result<UdpSocket> {
+    let bind_addr = unspecified_addr_for(remote);
+    let socket = build_udp_socket(bind_addr, cfg.udp_recv_buf, cfg.udp_send_buf, false)?;
+    socket.bind(&bind_addr.into())?;
+
+    let std_sock: std::net::UdpSocket = socket.into();
+    let tokio_sock = UdpSocket::from_std(std_sock)?;
+    Ok(tokio_sock)
+}
+
+fn build_udp_socket(
+    bind_addr: SocketAddr,
+    recv_buf: usize,
+    send_buf: usize,
+    reuseport: bool,
+) -> anyhow::Result<socket2::Socket> {
     use std::net::UdpSocket as StdUdp;
 
     let socket = socket2::Socket::new(
-        socket2::Domain::for_address(cfg.listen),
+        socket2::Domain::for_address(bind_addr),
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )?;
@@ -395,20 +429,16 @@ fn bind_udp(cfg: &Config, _worker_id: usize) -> anyhow::Result<UdpSocket> {
     socket.set_reuse_address(true)?;
 
     #[cfg(target_os = "linux")]
-    if cfg.reuseport {
+    if reuseport {
         socket.set_reuse_port(true)?;
     }
 
     // Kernel-level buffer sizes.
-    socket.set_recv_buffer_size(cfg.udp_recv_buf)?;
-    socket.set_send_buffer_size(cfg.udp_send_buf)?;
+    socket.set_recv_buffer_size(recv_buf)?;
+    socket.set_send_buffer_size(send_buf)?;
 
     socket.set_nonblocking(true)?;
-    socket.bind(&cfg.listen.into())?;
-
-    let std_sock: StdUdp = socket.into();
-    let tokio_sock = UdpSocket::from_std(std_sock)?;
-    Ok(tokio_sock)
+    Ok(socket)
 }
 
 fn bind_tcp_listener(cfg: &Config) -> anyhow::Result<TcpListener> {
@@ -447,5 +477,12 @@ fn apply_tcp_opts(stream: &TcpStream, cfg: &Config) {
         let buf = cfg.tcp_buf as libc::c_int;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &buf as *const _ as _, 4);
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &buf as *const _ as _, 4);
+    }
+}
+
+fn unspecified_addr_for(addr: &SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     }
 }

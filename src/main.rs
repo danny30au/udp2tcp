@@ -37,11 +37,13 @@ fn main() -> anyhow::Result<()> {
         reuseport = cfg.reuseport,
         cpu_pin   = cfg.cpu_pin,
         daemon    = cfg.daemon,
+        write_batch = cfg.write_batch,
+        flush_ms = cfg.flush_ms,
         "udp2tcp starting"
     );
 
     // Print sysctl tuning advice if buffers are at defaults.
-    if cfg.udp_recv_buf > 4_194_304 {
+    if cfg.udp_recv_buf <= 4_194_304 || cfg.udp_send_buf <= 4_194_304 {
         info!(
             "tip: raise kernel UDP buffers for full throughput:\n  \
              sysctl -w net.core.rmem_max=134217728\n  \
