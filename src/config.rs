@@ -68,6 +68,10 @@ pub struct Config {
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,
 
+    /// Run in background as a daemon (Linux only).
+    #[arg(long, env = "UDP2TCP_DAEMON", default_value_t = false)]
+    pub daemon: bool,
+
     /// Expose Prometheus metrics on this address (optional, requires --features metrics).
     #[cfg(feature = "metrics")]
     #[arg(long, env = "UDP2TCP_METRICS_ADDR")]

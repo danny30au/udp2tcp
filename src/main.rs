@@ -26,6 +26,8 @@ fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
+    daemonize_if_requested(&cfg)?;
+
     info!(
         version = env!("CARGO_PKG_VERSION"),
         threads = cfg.num_threads(),
@@ -34,6 +36,7 @@ fn main() -> anyhow::Result<()> {
         mode    = if cfg.reverse { "tcp→udp (reverse)" } else { "udp→tcp" },
         reuseport = cfg.reuseport,
         cpu_pin   = cfg.cpu_pin,
+        daemon    = cfg.daemon,
         "udp2tcp starting"
     );
 
@@ -70,4 +73,33 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("worker {worker_id}"))
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn daemonize_if_requested(cfg: &Config) -> anyhow::Result<()> {
+    if !cfg.daemon {
+        return Ok(());
+    }
+
+    const NO_CHDIR: libc::c_int = 1;
+    const NO_CLOSE_STDIO: libc::c_int = 1;
+
+    let rc = unsafe { libc::daemon(NO_CHDIR, NO_CLOSE_STDIO) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to daemonize process - check system permissions and resources");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemonize_if_requested(cfg: &Config) -> anyhow::Result<()> {
+    if cfg.daemon {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "--daemon is only supported on Linux",
+        )
+        .into());
+    }
+    Ok(())
 }

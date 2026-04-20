@@ -10,6 +10,7 @@ A high-performance, multi-core UDP ↔ TCP proxy written in Rust, purpose-built 
 - **Zero-copy path** — `Bytes` slices avoid unnecessary allocations on the hot path  
 - **Lock-free session table** — DashMap with per-worker sharding  
 - **Optional CPU affinity pinning** (`--cpu-pin`) for NUMA/cache locality  
+- **Optional Linux daemon mode** (`--daemon`) for background operation  
 - **Configurable via CLI flags or environment variables**  
 - **Prometheus metrics** (opt-in, `--features metrics`)  
 - Release profile: `opt-level=3`, fat LTO, single codegen unit, panic=abort
@@ -96,6 +97,15 @@ udp2tcp \
   --threads 4
 ```
 
+### Run as a Linux daemon
+
+```bash
+udp2tcp \
+  --listen 127.0.0.1:51820 \
+  --remote 203.0.113.1:51820 \
+  --daemon
+```
+
 ### All options
 
 | Flag | Env | Default | Description |
@@ -114,6 +124,7 @@ udp2tcp \
 | `--reuseport` | `UDP2TCP_REUSEPORT` | true | SO_REUSEPORT (Linux) |
 | `--cpu-pin` | `UDP2TCP_CPU_PIN` | false | Pin threads to CPU cores |
 | `--log-level` | `RUST_LOG` | info | Log level |
+| `--daemon` | `UDP2TCP_DAEMON` | false | Run in background as a daemon (Linux only) |
 
 ## Kernel tuning
 
