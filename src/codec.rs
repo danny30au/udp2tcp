@@ -27,6 +27,19 @@ pub const MAX_DATAGRAM_SIZE: usize = 65535;
 #[derive(Default, Debug, Clone, Copy)]
 pub struct WireGuardTcpCodec;
 
+pub fn encode_frame(item: &[u8], dst: &mut BytesMut) -> Result<(), ProxyError> {
+    let len = item.len();
+    if len == 0 || len > MAX_DATAGRAM_SIZE {
+        return Err(ProxyError::InvalidFrame(format!(
+            "cannot encode frame of length {len}"
+        )));
+    }
+    dst.reserve(2 + len);
+    dst.put_u16(len as u16);
+    dst.extend_from_slice(item);
+    Ok(())
+}
+
 impl Decoder for WireGuardTcpCodec {
     type Item = BytesMut;
     type Error = ProxyError;
@@ -67,16 +80,7 @@ impl Encoder<bytes::Bytes> for WireGuardTcpCodec {
     type Error = ProxyError;
 
     fn encode(&mut self, item: bytes::Bytes, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let len = item.len();
-        if len == 0 || len > MAX_DATAGRAM_SIZE {
-            return Err(ProxyError::InvalidFrame(format!(
-                "cannot encode frame of length {len}"
-            )));
-        }
-        dst.reserve(2 + len);
-        dst.put_u16(len as u16);
-        dst.put(item);
-        Ok(())
+        encode_frame(&item, dst)
     }
 }
 
@@ -105,5 +109,19 @@ mod tests {
         // Only 2 bytes of a 10-byte payload: should return None.
         let result = codec.decode(&mut buf).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn encode_frame_appends_multiple_frames() {
+        let mut buf = BytesMut::new();
+        encode_frame(b"one", &mut buf).unwrap();
+        encode_frame(b"two", &mut buf).unwrap();
+
+        let mut codec = WireGuardTcpCodec;
+        let first = codec.decode(&mut buf).unwrap().unwrap();
+        let second = codec.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(first.as_ref(), b"one");
+        assert_eq!(second.as_ref(), b"two");
     }
 }

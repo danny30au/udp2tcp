@@ -41,11 +41,11 @@ pub struct Config {
     pub tcp_buf: usize,
 
     /// Number of queued packets to batch before flushing the TCP writer.
-    #[arg(long, env = "UDP2TCP_WRITE_BATCH", default_value_t = 32)]
+    #[arg(long, env = "UDP2TCP_WRITE_BATCH", default_value_t = 64)]
     pub write_batch: usize,
 
     /// Maximum time to hold queued TCP frames before flushing, in milliseconds.
-    #[arg(long, env = "UDP2TCP_FLUSH_MS", default_value_t = 2)]
+    #[arg(long, env = "UDP2TCP_FLUSH_MS", default_value_t = 4)]
     pub flush_ms: u64,
 
     /// Number of parallel TCP streams per logical UDP session (UDP→TCP mode).
@@ -65,7 +65,7 @@ pub struct Config {
     pub idle_timeout: u64,
 
     /// Enable TCP_NODELAY on the TCP leg (reduces latency, slightly lower throughput).
-    #[arg(long, env = "UDP2TCP_NODELAY", default_value_t = true)]
+    #[arg(long, env = "UDP2TCP_NODELAY", default_value_t = false)]
     pub nodelay: bool,
 
     /// Enable SO_REUSEPORT on UDP sockets (allows multiple worker sockets on same port).
