@@ -38,6 +38,11 @@ use crate::{
     session::{Session, SessionTable},
 };
 
+const MIN_WIREGUARD_FRAME_CAPACITY: usize = 1_502;
+const MAX_BATCH_CAPACITY_HINT: usize = 128;
+const MIN_TCP_WRITE_BATCH_CAPACITY: usize = 4_096;
+const MAX_TCP_WRITE_BATCH_CAPACITY: usize = 8 * 1024 * 1024;
+
 // ─── mode A: UDP listen → TCP forward ──────────────────────────────────────
 
 /// Run in UDP→TCP proxy mode.
@@ -498,10 +503,13 @@ fn unspecified_addr_for(addr: &SocketAddr) -> SocketAddr {
 }
 
 fn tcp_write_batch_capacity(cfg: &Config, batch_size: usize) -> usize {
-    let per_frame = cfg.pkt_buf.saturating_add(2).max(1_502);
+    let per_frame = cfg
+        .pkt_buf
+        .saturating_add(2)
+        .max(MIN_WIREGUARD_FRAME_CAPACITY);
     per_frame
-        .saturating_mul(batch_size.min(128))
-        .clamp(4_096, 8 * 1024 * 1024)
+        .saturating_mul(batch_size.min(MAX_BATCH_CAPACITY_HINT))
+        .clamp(MIN_TCP_WRITE_BATCH_CAPACITY, MAX_TCP_WRITE_BATCH_CAPACITY)
 }
 
 async fn flush_encoded_frames<W: AsyncWrite + Unpin>(
