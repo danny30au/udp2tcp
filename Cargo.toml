@@ -29,11 +29,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Metrics / stats
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14", optional = true }
 
 # Error handling
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # CPU affinity pinning
 core_affinity = "0.8"
@@ -51,7 +51,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 dashmap = "6"
 
 # Cross-platform socket options (SO_REUSEPORT, buffer sizes)
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 # Raw libc calls for TCP buffer sizing
 libc = "0.2"
