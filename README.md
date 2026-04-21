@@ -119,13 +119,13 @@ udp2tcp \
 | `--udp-recv-buf` | `UDP2TCP_UDP_RECV_BUF` | 26214400 (25 MB) | UDP SO_RCVBUF |
 | `--udp-send-buf` | `UDP2TCP_UDP_SEND_BUF` | 26214400 (25 MB) | UDP SO_SNDBUF |
 | `--tcp-buf` | `UDP2TCP_TCP_BUF` | 4194304 (4 MB) | TCP SO_SNDBUF/SO_RCVBUF |
-| `--write-batch` | `UDP2TCP_WRITE_BATCH` | 32 | Number of TCP frames to batch before flushing |
-| `--flush-ms` | `UDP2TCP_FLUSH_MS` | 2 | Max time to hold queued TCP frames before flushing |
+| `--write-batch` | `UDP2TCP_WRITE_BATCH` | 64 | Number of TCP frames to batch before writing the aggregated batch to TCP |
+| `--flush-ms` | `UDP2TCP_FLUSH_MS` | 4 | Max time to hold queued TCP frames before writing the aggregated batch to TCP |
 | `--tcp-streams` | `UDP2TCP_TCP_STREAMS` | 1 | Parallel TCP streams per UDP session (UDP→TCP mode) |
 | `--pkt-buf` | `UDP2TCP_PKT_BUF` | 65536 | Per-read buffer size |
 | `--max-sessions` | `UDP2TCP_MAX_SESSIONS` | 65536 | Max UDP client sessions |
 | `--idle-timeout` | `UDP2TCP_IDLE_TIMEOUT` | 180 | Session idle timeout (s) |
-| `--nodelay` | `UDP2TCP_NODELAY` | true | TCP_NODELAY (disables Nagle for lower latency; set false for more coalescing) |
+| `--nodelay` | `UDP2TCP_NODELAY` | false | TCP_NODELAY (set true for lower latency; keep false for more TCP coalescing/throughput) |
 | `--reuseport` | `UDP2TCP_REUSEPORT` | true | SO_REUSEPORT (Linux) |
 | `--cpu-pin` | `UDP2TCP_CPU_PIN` | false | Pin threads to CPU cores |
 | `--log-level` | `RUST_LOG` | info | Log level |
@@ -154,6 +154,8 @@ For high-bandwidth or high-latency links, also try:
 - raising `--write-batch` to increase TCP write coalescing
 - raising `--flush-ms` slightly to allow larger batches
 - disabling `--nodelay` if raw throughput matters more than per-packet latency
+
+The periodic `stats` log now also reports queue drops, UDP syscall counts/average wait, TCP frame counts, flush counts, and average frames per TCP flush so you can see whether throughput is limited by queue pressure or too-frequent flushes.
 
 ## Running as a systemd service
 

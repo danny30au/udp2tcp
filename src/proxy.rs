@@ -17,21 +17,22 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use tokio::{
+    io::{AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc::{self, error::TryRecvError},
     time,
 };
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::codec::FramedRead;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    codec::WireGuardTcpCodec,
+    codec::{encode_frame, WireGuardTcpCodec},
     config::Config,
     metrics,
     session::{Session, SessionTable},
@@ -76,6 +77,7 @@ pub async fn run_udp_to_tcp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Resul
     loop {
         // Receive next UDP datagram from any client.
         pkt_buf.clear();
+        let recv_started = Instant::now();
         let (n, src_addr) = match udp_sock.recv_buf_from(&mut pkt_buf).await {
             Ok(v) => v,
             Err(e) => {
@@ -84,6 +86,7 @@ pub async fn run_udp_to_tcp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Resul
                 continue;
             }
         };
+        metrics::observe_udp_recv(recv_started.elapsed());
 
         let data = pkt_buf.split().freeze();
         metrics::inc_rx(n as u64);
@@ -129,6 +132,7 @@ pub async fn run_udp_to_tcp(cfg: Arc<Config>, worker_id: usize) -> anyhow::Resul
         // Forward the packet to the TCP task via channel.
         if session.try_send(data).is_err() {
             metrics::inc_errors();
+            metrics::inc_queue_drops();
             debug!(client = %src_addr, "all stream channels full/closed, dropping packet");
         }
     }
@@ -150,6 +154,7 @@ async fn tcp_forward_task(
     flush_interval: Duration,
 ) {
     // Connect to the remote TCP endpoint.
+    let connect_started = Instant::now();
     let tcp_stream = match TcpStream::connect(cfg.remote).await {
         Ok(s) => s,
         Err(e) => {
@@ -159,18 +164,18 @@ async fn tcp_forward_task(
             return;
         }
     };
+    metrics::observe_tcp_connect(connect_started.elapsed());
 
     apply_tcp_opts(&tcp_stream, &cfg);
     debug!(worker = worker_id, stream = stream_id, client = %client_addr, remote = %cfg.remote, "TCP connected");
 
-    let (tcp_rd, tcp_wr) = tcp_stream.into_split();
+    let (tcp_rd, mut tcp_wr) = tcp_stream.into_split();
     let mut framed_rd = FramedRead::new(tcp_rd, WireGuardTcpCodec);
-    let mut framed_wr = FramedWrite::new(tcp_wr, WireGuardTcpCodec);
 
-    use futures::SinkExt;
     use futures::StreamExt;
 
     let mut pending_writes = 0usize;
+    let mut write_buf = BytesMut::with_capacity(tcp_write_batch_capacity(&cfg, batch_size));
     let mut flush_tick = time::interval(flush_interval);
 
     // Run both directions concurrently until either side closes.
@@ -181,12 +186,13 @@ async fn tcp_forward_task(
                 match maybe_pkt {
                     Some(pkt) => {
                         let len = pkt.len();
-                        if let Err(e) = framed_wr.feed(pkt).await {
-                            error!(stream = stream_id, client = %client_addr, err = %e, "TCP write failed");
+                        if let Err(e) = encode_frame(&pkt, &mut write_buf) {
+                            error!(stream = stream_id, client = %client_addr, err = %e, "TCP frame encode failed");
                             metrics::inc_errors();
                             break;
                         }
                         metrics::inc_tx(len as u64);
+                        metrics::inc_tcp_frame_tx();
                         pending_writes += 1;
                         let mut write_failed = false;
                         let mut stream_disconnected = false;
@@ -195,13 +201,14 @@ async fn tcp_forward_task(
                             match rx.try_recv() {
                                 Ok(pkt) => {
                                     let len = pkt.len();
-                                    if let Err(e) = framed_wr.feed(pkt).await {
-                                        error!(stream = stream_id, client = %client_addr, err = %e, "TCP write failed");
+                                    if let Err(e) = encode_frame(&pkt, &mut write_buf) {
+                                        error!(stream = stream_id, client = %client_addr, err = %e, "TCP frame encode failed");
                                         metrics::inc_errors();
                                         write_failed = true;
                                         break;
                                     }
                                     metrics::inc_tx(len as u64);
+                                    metrics::inc_tcp_frame_tx();
                                     pending_writes += 1;
                                 }
                                 Err(TryRecvError::Empty) => break,
@@ -216,7 +223,7 @@ async fn tcp_forward_task(
                         }
                         if stream_disconnected {
                             if pending_writes > 0 {
-                                if let Err(e) = framed_wr.flush().await {
+                                if let Err(e) = flush_encoded_frames(&mut tcp_wr, &mut write_buf, &mut pending_writes).await {
                                     error!(stream = stream_id, client = %client_addr, err = %e, "TCP flush failed");
                                 }
                             }
@@ -224,17 +231,16 @@ async fn tcp_forward_task(
                         }
 
                         if pending_writes >= batch_size {
-                            if let Err(e) = framed_wr.flush().await {
+                            if let Err(e) = flush_encoded_frames(&mut tcp_wr, &mut write_buf, &mut pending_writes).await {
                                 error!(stream = stream_id, client = %client_addr, err = %e, "TCP flush failed");
                                 metrics::inc_errors();
                                 break;
                             }
-                            pending_writes = 0;
                         }
                     }
                     None => {
                         if pending_writes > 0 {
-                            if let Err(e) = framed_wr.flush().await {
+                            if let Err(e) = flush_encoded_frames(&mut tcp_wr, &mut write_buf, &mut pending_writes).await {
                                 error!(stream = stream_id, client = %client_addr, err = %e, "TCP flush failed");
                             }
                         }
@@ -248,10 +254,13 @@ async fn tcp_forward_task(
                 match maybe_frame {
                     Some(Ok(frame)) => {
                         let len = frame.len();
+                        metrics::inc_tcp_frame_rx();
+                        let send_started = Instant::now();
                         if let Err(e) = udp_sock.send_to(&frame, client_addr).await {
                             error!(client = %client_addr, err = %e, "UDP sendto failed");
                             metrics::inc_errors();
                         } else {
+                            metrics::observe_udp_send(send_started.elapsed());
                             metrics::inc_rx(len as u64);
                         }
                     }
@@ -268,12 +277,11 @@ async fn tcp_forward_task(
             }
 
             _ = flush_tick.tick(), if pending_writes > 0 => {
-                if let Err(e) = framed_wr.flush().await {
+                if let Err(e) = flush_encoded_frames(&mut tcp_wr, &mut write_buf, &mut pending_writes).await {
                     error!(stream = stream_id, client = %client_addr, err = %e, "TCP flush failed");
                     metrics::inc_errors();
                     break;
                 }
-                pending_writes = 0;
             }
         }
     }
@@ -322,17 +330,16 @@ async fn handle_tcp_client(
     udp_sock.connect(cfg.remote).await?;
     let udp_sock = Arc::new(udp_sock);
 
-    let (tcp_rd, tcp_wr) = tcp_stream.into_split();
+    let (tcp_rd, mut tcp_wr) = tcp_stream.into_split();
     let mut framed_rd = FramedRead::new(tcp_rd, WireGuardTcpCodec);
-    let mut framed_wr = FramedWrite::new(tcp_wr, WireGuardTcpCodec);
 
-    use futures::SinkExt;
     use futures::StreamExt;
 
     let batch_size = cfg.write_batch.max(1);
     let flush_interval = Duration::from_millis(cfg.flush_ms.max(1));
     let mut udp_buf = BytesMut::with_capacity(cfg.pkt_buf);
     let mut pending_writes = 0usize;
+    let mut write_buf = BytesMut::with_capacity(tcp_write_batch_capacity(&cfg, batch_size));
     let mut flush_tick = time::interval(flush_interval);
 
     debug!(worker = worker_id, peer = %peer_addr, remote = %cfg.remote, "reverse session started");
@@ -344,7 +351,10 @@ async fn handle_tcp_client(
                 match maybe_frame {
                     Some(Ok(frame)) => {
                         let len = frame.len();
+                        metrics::inc_tcp_frame_rx();
+                        let send_started = Instant::now();
                         udp_sock.send(&frame).await?;
+                        metrics::observe_udp_send(send_started.elapsed());
                         metrics::inc_rx(len as u64);
                     }
                     Some(Err(e)) => {
@@ -358,30 +368,32 @@ async fn handle_tcp_client(
             // Outbound: UDP datagram → TCP frame
             result = async {
                 udp_buf.clear();
+                let recv_started = Instant::now();
                 udp_sock.recv_buf(&mut udp_buf).await
+                    .map(|n| (n, recv_started.elapsed()))
             } => {
-                let n = result?;
+                let (n, recv_wait) = result?;
+                metrics::observe_udp_recv(recv_wait);
                 let data = udp_buf.split().freeze();
                 let len = n as u64;
-                framed_wr.feed(data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                encode_frame(&data, &mut write_buf).map_err(|e| anyhow::anyhow!("{e}"))?;
                 metrics::inc_tx(len);
+                metrics::inc_tcp_frame_tx();
                 pending_writes += 1;
 
                 if pending_writes >= batch_size {
-                    framed_wr.flush().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-                    pending_writes = 0;
+                    flush_encoded_frames(&mut tcp_wr, &mut write_buf, &mut pending_writes).await?;
                 }
             }
 
             _ = flush_tick.tick(), if pending_writes > 0 => {
-                framed_wr.flush().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-                pending_writes = 0;
+                flush_encoded_frames(&mut tcp_wr, &mut write_buf, &mut pending_writes).await?;
             }
         }
     }
 
     if pending_writes > 0 {
-        if let Err(e) = framed_wr.flush().await {
+        if let Err(e) = flush_encoded_frames(&mut tcp_wr, &mut write_buf, &mut pending_writes).await {
             error!(peer = %peer_addr, err = %e, "TCP final flush failed");
         }
     }
@@ -483,4 +495,30 @@ fn unspecified_addr_for(addr: &SocketAddr) -> SocketAddr {
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     }
+}
+
+fn tcp_write_batch_capacity(cfg: &Config, batch_size: usize) -> usize {
+    let per_frame = cfg.pkt_buf.saturating_add(2).max(1_502);
+    per_frame
+        .saturating_mul(batch_size.min(128))
+        .clamp(4_096, 8 * 1024 * 1024)
+}
+
+async fn flush_encoded_frames<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    write_buf: &mut BytesMut,
+    pending_writes: &mut usize,
+) -> std::io::Result<()> {
+    if *pending_writes == 0 || write_buf.is_empty() {
+        *pending_writes = 0;
+        write_buf.clear();
+        return Ok(());
+    }
+
+    let flush_started = Instant::now();
+    writer.write_all(&write_buf[..]).await?;
+    metrics::observe_tcp_flush(*pending_writes as u64, flush_started.elapsed());
+    write_buf.clear();
+    *pending_writes = 0;
+    Ok(())
 }
