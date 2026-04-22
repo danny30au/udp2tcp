@@ -61,10 +61,16 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
+# Faster general-purpose allocator for the hot packet path (opt-in)
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
 [features]
-default = []
+default = ["mimalloc-allocator"]
 metrics = ["dep:prometheus"]
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
+# Use mimalloc as the global allocator. On by default; disable with
+# `--no-default-features` if your platform has trouble building it.
+mimalloc-allocator = ["dep:mimalloc"]
 
 [profile.release]
 opt-level = 3

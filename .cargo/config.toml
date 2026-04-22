@@ -1,0 +1,27 @@
+# Cargo build configuration template for udp2tcp.
+#
+# The defaults here are intentionally portable so CI's release musl build
+# stays reproducible. To squeeze out the last 5–15% on a known target CPU,
+# uncomment the appropriate `rustflags` line below or set RUSTFLAGS in the
+# environment when building.
+#
+# Examples:
+#
+#   # Tune for the local machine (NOT portable — best for self-hosted boxes).
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release
+#
+#   # Tune for a baseline that includes AVX2/BMI/FMA (portable across most
+#   # post-2013 Intel/AMD chips, much faster than the default x86-64 baseline).
+#   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+#
+# To enable these globally for all builds in this checkout, uncomment one of
+# the lines below.
+#
+# [build]
+# rustflags = ["-C", "target-cpu=native"]
+#
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "target-cpu=x86-64-v3"]
+#
+# [target.x86_64-unknown-linux-musl]
+# rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "linker=clang", "-C", "link-arg=-fuse-ld=lld"]

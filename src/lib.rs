@@ -1,3 +1,4 @@
+pub mod batched_io;
 pub mod codec;
 pub mod config;
 pub mod error;

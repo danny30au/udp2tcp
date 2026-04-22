@@ -14,6 +14,10 @@ A high-performance, multi-core UDP ↔ TCP proxy written in Rust, purpose-built 
 - **Optional Linux daemon mode** (`--daemon`) for background operation  
 - **Configurable via CLI flags or environment variables**  
 - **Prometheus metrics** (opt-in, `--features metrics`)  
+- **mimalloc global allocator** (default-on, `--no-default-features` to disable) for lower-latency hot-path allocations
+- **Batched UDP I/O on Linux** — uses `recvmmsg`/`sendmmsg` to drain up to 32 datagrams per syscall and best-effort `UDP_GRO` for kernel-side coalescing
+- **Vectored TCP writes** — outbound frames are emitted with `writev`, eliminating one per-packet payload `memcpy`
+- **Sampled latency metrics** — packet counters are always-on, but `Instant::now()` is taken on a 1-in-64 schedule to keep the hot path lean
 - Release profile: `opt-level=3`, fat LTO, single codegen unit, panic=abort
 
 ## Build
@@ -32,6 +36,47 @@ cargo build --release --features metrics
 ```
 
 The binary lands at `target/release/udp2tcp`.
+
+### Tuning the CPU baseline
+
+The default release build targets the conservative `x86-64` baseline so it
+runs anywhere. On a known machine you can typically squeeze out an extra
+5–15% by enabling the local CPU's full instruction set (AVX2, BMI, FMA, …):
+
+```bash
+# Best for self-hosted boxes — binary is NOT portable.
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+# Portable across most post-2013 Intel/AMD CPUs (AVX2/BMI/FMA baseline).
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+```
+
+A commented `.cargo/config.toml` template is included with ready-to-uncomment
+`rustflags` blocks for both options.
+
+### Profile-Guided Optimization (PGO)
+
+PGO typically yields another 5–15% on a network proxy. The flow is:
+
+```bash
+# 1. Build an instrumented binary.
+RUSTFLAGS="-C target-cpu=native -Cprofile-generate=/tmp/pgo-data" \
+  cargo build --release --target x86_64-unknown-linux-gnu
+
+# 2. Run a representative workload through it (a few minutes of real or
+#    synthetic traffic in the modes you care about).
+./target/x86_64-unknown-linux-gnu/release/udp2tcp -l 0.0.0.0:51820 -r ...
+
+# 3. Merge the raw profiles. Requires `llvm-profdata` from the Rust toolchain
+#    (install with `rustup component add llvm-tools-preview`).
+llvm-profdata merge -o /tmp/pgo-data/merged.profdata /tmp/pgo-data
+
+# 4. Rebuild using the collected profile.
+RUSTFLAGS="-C target-cpu=native -Cprofile-use=/tmp/pgo-data/merged.profdata" \
+  cargo build --release --target x86_64-unknown-linux-gnu
+```
+
+For a turnkey workflow, `cargo install cargo-pgo` automates steps 1 and 4.
 
 ## Architecture
 

@@ -12,6 +12,14 @@ use udp2tcp_lib::{
     worker::spawn_workers,
 };
 
+// Use mimalloc as the global allocator on the hot packet path. The default
+// system allocator is rarely a great fit for many small `BytesMut` allocations
+// per second; mimalloc has lower latency and better thread-locality. Built only
+// when the `mimalloc-allocator` feature is enabled (on by default).
+#[cfg(feature = "mimalloc-allocator")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::parse());
 

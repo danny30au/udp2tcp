@@ -1,7 +1,18 @@
 //! In-process metrics (always available, Prometheus export requires --features metrics).
+//!
+//! Latency observations (`observe_*`) are cheap to call but `Instant::now()`
+//! at the call site is not free at multi-Mpps rates. To keep the hot path
+//! lean, we expose:
+//!
+//!   * `inc_*` and counter helpers — single relaxed atomic adds, always on.
+//!   * `LatencySampler` — per-thread, branchless 1-in-N sampler so callers
+//!     only take an `Instant::now()` reading every Nth packet. The sampled
+//!     latency is then submitted via `observe_*_sampled`, which scales the
+//!     accumulated nanos by the sampling stride so averages remain unbiased.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub static PACKETS_RX: AtomicU64 = AtomicU64::new(0);
 pub static PACKETS_TX: AtomicU64 = AtomicU64::new(0);
@@ -21,6 +32,32 @@ pub static TCP_FRAMES_TX: AtomicU64 = AtomicU64::new(0);
 pub static TCP_FLUSHES: AtomicU64 = AtomicU64::new(0);
 pub static TCP_BATCHED_FRAMES: AtomicU64 = AtomicU64::new(0);
 pub static TCP_FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Take a latency sample roughly once every `LATENCY_SAMPLE_STRIDE` events.
+/// Picked as a power of two so the "should-sample" check folds into a mask.
+pub const LATENCY_SAMPLE_STRIDE: u64 = 64;
+const LATENCY_SAMPLE_MASK: u64 = LATENCY_SAMPLE_STRIDE - 1;
+
+thread_local! {
+    static SAMPLE_COUNTER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Per-thread sampler. Returns `Some(Instant::now())` once every
+/// `LATENCY_SAMPLE_STRIDE` calls from the same thread, otherwise `None`.
+/// Callers should pair this with `observe_*_sampled` to record the elapsed
+/// time when (and only when) a sample is taken.
+#[inline(always)]
+pub fn sample_start() -> Option<Instant> {
+    SAMPLE_COUNTER.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        if n & LATENCY_SAMPLE_MASK == 0 {
+            Some(Instant::now())
+        } else {
+            None
+        }
+    })
+}
 
 #[inline(always)]
 pub fn inc_rx(bytes: u64) {
@@ -44,16 +81,26 @@ pub fn inc_queue_drops() {
     QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record a sampled UDP recv wait. `start` must come from `sample_start()`
+/// taken just before the recv was issued. No-op when `start` is `None`.
 #[inline(always)]
-pub fn observe_udp_recv(wait: Duration) {
-    UDP_RECV_CALLS.fetch_add(1, Ordering::Relaxed);
-    UDP_RECV_WAIT_NS.fetch_add(duration_to_nanos(wait), Ordering::Relaxed);
+pub fn observe_udp_recv_sampled(start: Option<Instant>) {
+    if let Some(t0) = start {
+        let scaled = duration_to_nanos(t0.elapsed()).saturating_mul(LATENCY_SAMPLE_STRIDE);
+        UDP_RECV_CALLS.fetch_add(LATENCY_SAMPLE_STRIDE, Ordering::Relaxed);
+        UDP_RECV_WAIT_NS.fetch_add(scaled, Ordering::Relaxed);
+    }
 }
 
+/// Record a sampled UDP send wait. `start` must come from `sample_start()`
+/// taken just before the send was issued. No-op when `start` is `None`.
 #[inline(always)]
-pub fn observe_udp_send(wait: Duration) {
-    UDP_SEND_CALLS.fetch_add(1, Ordering::Relaxed);
-    UDP_SEND_WAIT_NS.fetch_add(duration_to_nanos(wait), Ordering::Relaxed);
+pub fn observe_udp_send_sampled(start: Option<Instant>) {
+    if let Some(t0) = start {
+        let scaled = duration_to_nanos(t0.elapsed()).saturating_mul(LATENCY_SAMPLE_STRIDE);
+        UDP_SEND_CALLS.fetch_add(LATENCY_SAMPLE_STRIDE, Ordering::Relaxed);
+        UDP_SEND_WAIT_NS.fetch_add(scaled, Ordering::Relaxed);
+    }
 }
 
 #[inline(always)]
@@ -68,10 +115,21 @@ pub fn inc_tcp_frame_rx() {
 }
 
 #[inline(always)]
+pub fn inc_tcp_frame_rx_n(n: u64) {
+    TCP_FRAMES_RX.fetch_add(n, Ordering::Relaxed);
+}
+
+#[inline(always)]
 pub fn inc_tcp_frame_tx() {
     TCP_FRAMES_TX.fetch_add(1, Ordering::Relaxed);
 }
 
+#[inline(always)]
+pub fn inc_tcp_frame_tx_n(n: u64) {
+    TCP_FRAMES_TX.fetch_add(n, Ordering::Relaxed);
+}
+
+/// TCP flushes always observe latency (one call per batch, low-rate).
 #[inline(always)]
 pub fn observe_tcp_flush(frames: u64, wait: Duration) {
     TCP_FLUSHES.fetch_add(1, Ordering::Relaxed);
