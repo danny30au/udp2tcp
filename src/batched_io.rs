@@ -251,13 +251,11 @@ mod linux {
         default_dst: Option<SocketAddr>,
     ) -> io::Result<usize> {
         let n = items.len().min(BATCH_MAX);
-        let mut iovs: [MaybeUninit<libc::iovec>; BATCH_MAX] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+        let mut iovs: [MaybeUninit<libc::iovec>; BATCH_MAX] = [MaybeUninit::uninit(); BATCH_MAX];
         let mut addrs: [MaybeUninit<libc::sockaddr_storage>; BATCH_MAX] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+            [MaybeUninit::uninit(); BATCH_MAX];
         let mut addr_lens: [libc::socklen_t; BATCH_MAX] = [0; BATCH_MAX];
-        let mut msgs: [MaybeUninit<libc::mmsghdr>; BATCH_MAX] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+        let mut msgs: [MaybeUninit<libc::mmsghdr>; BATCH_MAX] = [MaybeUninit::uninit(); BATCH_MAX];
 
         for i in 0..n {
             let dst = items[i].dst.or(default_dst);

@@ -381,10 +381,9 @@ async fn handle_tcp_client(
                 udp_sock.recv_buf(&mut udp_buf).await
                     .map(|n| (n, recv_started))
             } => {
-                let (n, recv_started) = result?;
+                let (_n, recv_started) = result?;
                 metrics::observe_udp_recv_sampled(recv_started);
                 let data = udp_buf.split().freeze();
-                let _ = n; // length carried by `data`
                 pending.push(data).map_err(|e| anyhow::anyhow!("{e}"))?;
 
                 if pending.len() >= batch_size {
